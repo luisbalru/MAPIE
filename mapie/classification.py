@@ -4,6 +4,7 @@ import warnings
 from typing import Any, Iterable, List, Optional, Tuple, Union, cast
 
 import numpy as np
+from fastdtw import fastdtw
 from joblib import Parallel, delayed
 from sklearn.base import BaseEstimator, ClassifierMixin, clone
 from sklearn.model_selection import BaseCrossValidator, ShuffleSplit
@@ -22,6 +23,39 @@ from .utils import (check_alpha, check_alpha_and_n_samples, check_cv,
                     check_n_jobs, check_null_weight, check_verbose,
                     compute_quantiles, fit_estimator, fix_number_of_classes)
 
+
+def add_gaussian_noise(ts, noise_ratio = 0.3):
+    mu = np.mean(ts)
+    std = np.std(ts)
+    noise = np.random.normal(mu, std, size=ts.shape)
+    size = int((1-noise_ratio)*ts.size)
+    random_nulls = np.random.choice(np.arange(noise.size), size=size, replace=False)
+    noise[random_nulls] = 0
+    return ts+noise
+
+
+def get_knn_timeseries(ts, label, X, y, k=1, distance=fastdtw):
+    y = y.reshape(1,y.shape[0])
+    data = np.concatenate((X,y.T), axis=1)
+    data = data[data[:,-1]==label][:,:-1].astype(float)  
+    distances = np.array([distance(ts, data[i,:])[0] for i in range(data.shape[0])])
+    ind = np.argpartition(distances, k+1)
+    return data[ind[:(k+1)], :], distances[ind[:(k+1)]]
+
+
+def get_predict_proba(X, y, estimator):
+    X_proba_preds = estimator.predict_proba(X)
+    mean_proba_preds = []
+    for i in range(X.shape[0]):
+        data, distances = get_knn_timeseries(X[i,:],y[i], X, y)
+        data = np.delete(data, distances==0, axis=0)
+        distances = np.delete(distances, distances==0, axis=0)
+        noisy_data = np.array([add_gaussian_noise(ts) for ts in data])
+        proba_preds = estimator.predict_proba(noisy_data)
+        mean_proba_preds.append(np.mean(proba_preds, axis=0))
+    
+    mean_proba_preds = np.array(mean_proba_preds)
+    return (X_proba_preds+mean_proba_preds)/2
 
 class MapieClassifier(BaseEstimator, ClassifierMixin):
     """
@@ -1160,8 +1194,16 @@ class MapieClassifier(BaseEstimator, ClassifierMixin):
 
         # Work
         if cv == "prefit":
+            # AQUÍ
+            """
+            Para cada instancia de X:
+                - Calcular sus k vecinos más cercanos con la misma etiqueta
+                - Aplicarle ruido gaussiano
+                - Calcular el predict proba
+                - y_pred_proba = media element-wise del predict_proba de X y las metrices de vecinos más cercanos
+            """
             self.single_estimator_ = estimator
-            y_pred_proba = self.single_estimator_.predict_proba(X)
+            y_pred_proba = get_predict_proba(X,y,self.single_estimator_)
             y_pred_proba = self._check_proba_normalized(y_pred_proba)
 
         else:
@@ -1229,6 +1271,7 @@ class MapieClassifier(BaseEstimator, ClassifierMixin):
                 dtype="float"
             )
         elif self.method in ["score", "lac"]:
+            # AQUÍ ESTÁ EL TURRÓN. 1-np.mean(y_pred_proba,knn_ts con la misma label)
             self.conformity_scores_ = np.take_along_axis(
                 1 - y_pred_proba, y_enc.reshape(-1, 1), axis=1
             )
